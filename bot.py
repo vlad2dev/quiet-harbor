@@ -478,28 +478,53 @@ class Bot:
         if urgent and move_yaw is None:
             move_yaw = math.atan2(cc[1] - y, cc[0] - x)
 
-        # kiting: hurt and someone close -> back off from them (while facing them)
+        # threats: keep away from mechs we have not engaged; strafe and back off in a fight
         target = None
         if enemies:
             target = enemies[0]
         elif attacker is not None:
             target = attacker
-        if target is not None and target["kind"] == "mech" and hp_frac < 0.45 and not urgent:
+        mech_target = target is not None and target["kind"] == "mech"
+        tdist = target.get("_d", 1e9) if target is not None else 1e9
+        engaged = mech_target and (attacker is target or tdist < 55)
+        flee = False
+        if mech_target and not urgent:
             tx, ty = target["pos"][0], target["pos"][1]
             away = math.atan2(y - ty, x - tx)
-            # prefer the away direction that keeps us toward the zone center
             to_c = math.atan2(cc[1] - y, cc[0] - x)
-            if abs(wrap(away - to_c)) > 2.0 and dz > cr * 0.5:
-                away = wrap(away + (0.9 if wrap(to_c - away) > 0 else -0.9))
-            move_yaw = away
-
+            # repulsion from every visible mech
+            rx = ry = 0.0
+            for e in enemies:
+                d = max(e["_d"], 5.0)
+                if d < 170:
+                    rx += (x - e["pos"][0]) / d / d
+                    ry += (y - e["pos"][1]) / d / d
+            if rx or ry:
+                away = math.atan2(ry, rx)
+            # never run out of the circle the zone is closing to
+            if dz > cr * 0.6 and abs(wrap(away - to_c)) > 1.4:
+                away = wrap(to_c + (1.4 if wrap(away - to_c) > 0 else -1.4))
+            if hp_frac < 0.5 or len([e for e in enemies if e["_d"] < 120]) >= 2:
+                move_yaw = away
+                flee = True
+            elif engaged:
+                # strafe across their line of fire, drifting away
+                if t - getattr(self, "strafe_t", -9) > 1.3 + random.random():
+                    self.strafe_t = t
+                    self.strafe_s = random.choice((-1, 1))
+                perp = math.atan2(ty - y, tx - x) + self.strafe_s * math.pi / 2
+                move_yaw = math.atan2(math.sin(perp) + 0.6 * math.sin(away), math.cos(perp) + 0.6 * math.cos(away))
+                if target.get("charging"):
+                    move_yaw = perp  # dodge the beam
+            elif tdist < 170:
+                move_yaw = away
         # stuck handling
         if self.last_pos is not None and move_yaw is not None:
             moved = math.dist(self.last_pos[:2], (x, y))
             self.stuck = self.stuck + 1 if moved < 0.25 else 0
         self.last_pos = (x, y, z)
         jump = False
-        boost = urgent or (target is not None and hp_frac < 0.45)
+        boost = urgent or flee or (engaged and target.get("charging", False))
         if self.unstick > 0:
             self.unstick -= 1
             move_yaw = self.unstick_dir
@@ -526,13 +551,13 @@ class Bot:
         if target is not None:
             aim, dh = self.lead(me, target, self.gun_speed)
             err = abs(wrap(me["aim"][0] - aim[0]))
-            tol = math.atan2(2.2, max(dh, 1.0)) + 0.01
-            engage = (target["_d"] if "_d" in target else dh) < 190 or attacker is not None
+            tol = math.atan2(3.0, max(dh, 1.0)) + 0.025
+            engage = engaged or tdist < 110 or attacker is not None
             if target["kind"] == "npc":
                 engage = attacker is target
             if engage:
                 g0 = weapons[0]
-                if g0 and g0["kind"] == "gun" and err < tol and abs(me["aim"][1] - aim[1]) < 0.06 and dh < g0["stats"].get("range", 230):
+                if g0 and g0["kind"] == "gun" and err < tol and abs(me["aim"][1] - aim[1]) < 0.1 and dh < g0["stats"].get("range", 230):
                     fire[0] = g0.get("reload", 0) == 0
                     if g0.get("ammo", 1) == 0:
                         act["reload"] = True
