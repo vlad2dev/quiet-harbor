@@ -374,6 +374,39 @@ class Bot:
         dh = math.hypot(ax - ox, ay - oy)
         return [math.atan2(ay - oy, ax - ox), math.atan2(az - oz, dh)], dh
 
+    # ---------- helpers ----------
+    def seen(self, obs, me):
+        x, y = me["pos"][0], me["pos"][1]
+        mechs, npcs = [], []
+        for m in obs["mechs"]:
+            m["_d"] = math.dist(m["pos"][:2], (x, y))
+            (mechs if m["kind"] == "mech" else npcs).append(m)
+        mechs.sort(key=lambda m: m["_d"])
+        npcs.sort(key=lambda m: m["_d"])
+        return mechs, npcs
+
+    def choose_target(self, enemies):
+        """Weakest effective target: low hp, close, or the one shooting us."""
+        best, bs = None, 1e18
+        for e in enemies:
+            hp = e.get("hp") or e.get("max_hp") or 1400
+            s = hp + 6.0 * e["_d"]
+            if self.threat and e["id"] == self.threat[2]:
+                s -= 300
+            if s < bs:
+                bs, best = s, e
+        return best
+
+    def upgrade_pick(self, offer):
+        pref = ["armor", "plating", "gun_damage", "lightning_efficiency", "gun_rate", "laser_damage",
+                "nanites", "lightning_chain", "laser_charge", "servos", "gun_mag", "lightning_range",
+                "gun_velocity", "reactor", "capacitor", "sensors", "jets", "gyros"]
+        ids = [c["id"] for c in offer["choices"]]
+        for p in pref:
+            if p in ids:
+                return ids.index(p)
+        return 0
+
     # ---------- main ----------
     def act(self, obs):
         t0 = time.perf_counter()
@@ -384,209 +417,247 @@ class Bot:
         act = {"tick": obs["tick"]}
         hp_frac = me["hp"] / max(1.0, me["max_hp"])
         zone = obs["zone"]
-
-        # upgrades: survival first
-        if obs.get("offer"):
-            pref = ["armor", "plating", "nanites", "sensors", "servos", "gun_damage", "gun_rate",
-                    "laser_damage", "laser_charge", "reactor", "capacitor", "jets", "gyros"]
-            ch = obs["offer"]["choices"]
-            ids = [c["id"] for c in ch]
-            pick = 0
-            for p in pref:
-                if p in ids:
-                    pick = ids.index(p)
-                    break
-            act["pick"] = pick
-
         weapons = me["weapons"]
         kinds = [w["kind"] if w else None for w in weapons]
+        if obs.get("offer"):
+            act["pick"] = self.upgrade_pick(obs["offer"])
 
-        # threats
         for ev in obs.get("events", []):
             if ev.get("type") == "damaged" and ev.get("bearing") is not None:
                 self.threat = (ev["bearing"], t, ev.get("by"))
-        enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
-        npcs = [m for m in obs["mechs"] if m["kind"] == "npc"]
-        for m in enemies:
-            m["_d"] = math.dist(m["pos"][:2], (x, y))
-        enemies.sort(key=lambda m: m["_d"])
+                self.last_hurt = t
+            if ev.get("type") == "hit":
+                self.last_dealt = t
+        # accuracy instrumentation (stderr only)
+        g = weapons[0]
+        st = self.__dict__.setdefault("stats", {"shots": 0, "gun_hits": 0, "laser_shots": 0, "laser_hits": 0})
+        if g and g["kind"] == "gun":
+            pa = getattr(self, "prev_ammo", None)
+            if pa is not None and g.get("ammo", 0) < pa:
+                st["shots"] += pa - g["ammo"]
+            self.prev_ammo = g.get("ammo", 0)
+        w1s = weapons[1]
+        if w1s and w1s["kind"] == "laser":
+            if getattr(self, "prev_lcd", 0) <= 0 and w1s["cooldown"] > 0.5:
+                st["laser_shots"] += 1
+            self.prev_lcd = w1s["cooldown"]
+        for ev in obs.get("events", []):
+            if ev.get("type") == "hit" and ev.get("target", 0) < 100:
+                if ev.get("weapon") == "gun":
+                    st["gun_hits"] += 1
+                elif ev.get("weapon") == "laser":
+                    st["laser_hits"] += 1
+        if obs["tick"] % 200 == 0:
+            log("stats", t, json.dumps(st))
+        enemies, npcs = self.seen(obs, me)
+        visible_ids = {m["id"] for m in obs["mechs"]}
+        blind_hit = bool(self.threat and t - self.threat[1] < 1.5 and self.threat[2] is not None
+                         and self.threat[2] < 100 and self.threat[2] not in visible_ids)
+        cc, cr = self.zone_at(zone, t + 3)
+        dz = math.hypot(x - cc[0], y - cc[1])
+        urgent = dz > cr - 4 or not me["in_zone"]
+        nc, nr = zone["next_center"], zone["next_radius"]
+        has_lightning = "lightning" in kinds
+
+        # ----- target -----
+        target = self.choose_target(enemies)
         attacker = None
         if self.threat and t - self.threat[1] < 3:
             for m in obs["mechs"]:
                 if m["id"] == self.threat[2]:
                     attacker = m
-
-        # goal selection: refresh when zone changes or periodically
-        avoid = [(n["pos"][0], n["pos"][1], 55.0) for n in npcs]
-        for d in obs.get("drops", []):
-            avoid.append((d["pos"][0], d["pos"][1], 45.0))
-        for e in enemies:
-            avoid.append((e["pos"][0], e["pos"][1], 80.0))
-        zkey = (round(zone["next_center"][0], 1), round(zone["next_center"][1], 1), round(zone["next_radius"], 1))
-        nc, nr = zone["next_center"], zone["next_radius"]
-        dist_next = math.hypot(x - nc[0], y - nc[1])
-        need_new = (self.goal is None or zkey != self.goal_key or
-                    math.hypot(self.goal[0] - nc[0], self.goal[1] - nc[1]) > max(nr * 0.85, 3))
-        if not need_new and enemies and math.hypot(self.goal[0] - enemies[0]["pos"][0],
-                                                   self.goal[1] - enemies[0]["pos"][1]) < 40:
-            need_new = True
-        if need_new and (self.goal_key != zkey or t - getattr(self, "goal_t", -99) > 4):
-            self.goal = self.pick_goal(me, zone, avoid)
-            self.goal_key = zkey
-            self.goal_t = t
-            self.path = []
-            self.search = None
-
-        # opportunistic loot: cubes and wanted weapons close by, if nobody is around
-        detour = None
-        if not enemies or enemies[0]["_d"] > 120:
-            cands = []
-            for c in obs.get("cubes", []):
-                d = math.dist(c["pos"][:2], (x, y))
-                if d < 35 and abs(c["pos"][2] - z) < 4:
-                    cands.append((d, c["pos"]))
-            for p in obs.get("pickups", []):
-                if p["kind"] in self.wanted and p["kind"] not in kinds and abs(p["pos"][2] - z) < 4:
-                    d = math.dist(p["pos"][:2], (x, y))
-                    if d < 45:
-                        cands.append((d - 15, p["pos"]))
-            if cands and (me["in_zone"] or zone["radius"] > 200):
-                cands.sort(key=lambda c: c[0])
-                detour = cands[0][1]
-        for p in obs.get("pickups", []):
-            if math.dist(p["pos"][:2], (x, y)) < self.reach and abs(p["pos"][2] - z) < 4:
-                if p["kind"] in self.wanted and p["kind"] not in kinds:
-                    if kinds[1] is None:
-                        act["take"] = p["id"]
-                    elif kinds[1] not in self.wanted or (p["kind"] == "laser" and kinds[1] != "laser"):
-                        if not (weapons[1] and weapons[1].get("charge", 0) > 0):
-                            act["take"] = p["id"]
-                            act["drop"] = 1
+        npc_target = None
+        if target is None:
+            for n in npcs:
+                if attacker is n or (n["_d"] < 70 and hp_frac > 0.6):
+                    npc_target = n
                     break
 
-        # movement
+        # recover: when low and nobody is on top of us, stop shooting and get out of sight to regenerate
+        near = min((e["_d"] for e in enemies), default=1e9)
+        if hp_frac < 0.4 and near > 55:
+            self.recovering = True
+        if getattr(self, "recovering", False) and (hp_frac > 0.85 or near < 40):
+            self.recovering = False
+        recovering = getattr(self, "recovering", False) and not urgent
+        if recovering:
+            npc_target = None
+
+        # ----- loot -----
+        detour = None
+        quiet = target is None or target["_d"] > 110
+        cands = []
+        for c in obs.get("cubes", []):
+            d = math.dist(c["pos"][:2], (x, y))
+            if abs(c["pos"][2] - z) < 5 and d < (70 if quiet else 25):
+                cands.append((d, c["pos"]))
+        for p in obs.get("pickups", []):
+            if abs(p["pos"][2] - z) > 5 or p["kind"] in kinds:
+                continue
+            if p["kind"] in ("lightning", "laser") and kinds[1] in (None, "mortar"):
+                d = math.dist(p["pos"][:2], (x, y))
+                bonus = 70 if p["kind"] == "laser" else 40
+                if d < ((220 if p["kind"] == "laser" else 160) if quiet else 30):
+                    cands.append((d - bonus, p["pos"]))
+        if cands and not urgent:
+            cands.sort(key=lambda c: c[0])
+            detour = cands[0][1]
+        for p in obs.get("pickups", []):
+            if math.dist(p["pos"][:2], (x, y)) < self.reach and abs(p["pos"][2] - z) < 4 and p["kind"] not in kinds:
+                if p["kind"] in ("lightning", "laser"):
+                    if kinds[1] is None:
+                        act["take"] = p["id"]
+                        break
+                    if kinds[1] == "mortar":
+                        act["take"] = p["id"]
+                        act["drop"] = 1
+                        break
+
+        # ----- movement -----
         move_yaw = None
-        if detour is not None:
+        boost = False
+        if recovering:
+            rx = ry = 0.0
+            for e in enemies + npcs:
+                dd = max(e["_d"], 5.0)
+                rx += (x - e["pos"][0]) / dd / dd
+                ry += (y - e["pos"][1]) / dd / dd
+            if self.threat and t - self.threat[1] < 6:
+                rx -= math.cos(self.threat[0]) * 0.01
+                ry -= math.sin(self.threat[0]) * 0.01
+            if rx or ry:
+                move_yaw = math.atan2(ry, rx)
+                to_c = math.atan2(cc[1] - y, cc[0] - x)
+                if dz > cr * 0.6 and abs(wrap(move_yaw - to_c)) > 1.4:
+                    move_yaw = wrap(to_c + (1.4 if wrap(move_yaw - to_c) > 0 else -1.4))
+                boost = me["energy"] > 25
+        elif target is not None and not urgent:
+            tx, ty = target["pos"][0], target["pos"][1]
+            to_t = math.atan2(ty - y, tx - x)
+            d = target["_d"]
+            ehp = target.get("hp") or 1400
+            want = 32.0 if has_lightning else 70.0
+            outnumbered = len([e for e in enemies if e["_d"] < 130]) >= 3
+            losing = hp_frac < 0.3 and ehp > me["hp"] * 1.2
+            if t >= getattr(self, "strafe_next", -1):
+                self.strafe_next = t + 0.3 + 0.6 * random.random()
+                self.strafe_s = -getattr(self, "strafe_s", 1) if random.random() < 0.75 else getattr(self, "strafe_s", 1)
+            perp = to_t + self.strafe_s * math.pi / 2
+            if losing or (outnumbered and hp_frac < 0.6):
+                rx = ry = 0.0
+                for e in enemies:
+                    dd = max(e["_d"], 5.0)
+                    rx += (x - e["pos"][0]) / dd / dd
+                    ry += (y - e["pos"][1]) / dd / dd
+                away = math.atan2(ry, rx)
+                to_c = math.atan2(cc[1] - y, cc[0] - x)
+                if dz > cr * 0.6 and abs(wrap(away - to_c)) > 1.4:
+                    away = wrap(to_c + (1.4 if wrap(away - to_c) > 0 else -1.4))
+                move_yaw = away
+                boost = me["energy"] > 10
+            else:
+                radial = 0.0
+                if d > want + 15:
+                    radial = 1.0
+                elif d < want - 12:
+                    radial = -0.8
+                mx = math.cos(perp) + radial * math.cos(to_t)
+                my = math.sin(perp) + radial * math.sin(to_t)
+                move_yaw = math.atan2(my, mx)
+                if d < 150 and me["energy"] > 25:
+                    boost = True
+                if target.get("charging"):
+                    move_yaw = perp
+                    boost = True
+        elif npc_target is not None and not urgent:
+            n = npc_target
+            to_n = math.atan2(n["pos"][1] - y, n["pos"][0] - x)
+            if n["_d"] > 45:
+                move_yaw = to_n
+            else:
+                move_yaw = to_n + math.pi / 2 * (1 if int(t / 2) % 2 else -1)
+        elif detour is not None:
             move_yaw = math.atan2(detour[1] - y, detour[0] - x)
         else:
+            key = (round(nc[0]), round(nc[1]), round(nr))
+            if self.goal is None or self.goal_key != key:
+                self.goal = self.pick_goal(me, zone, [(n["pos"][0], n["pos"][1], 40.0) for n in npcs])
+                self.goal_key = key
+                self.path = []
+                self.search = None
             self.plan(me, deadline)
             move_yaw = self.follow(me)
-        # stay inside the zone circle as it shrinks
-        cc, cr = self.zone_at(zone, t + 3)
-        dz = math.hypot(x - cc[0], y - cc[1])
-        urgent = dz > cr - 4 or not me["in_zone"]
-        if urgent and move_yaw is None:
-            move_yaw = math.atan2(cc[1] - y, cc[0] - x)
-
-        # threats: keep away from mechs we have not engaged; strafe and back off in a fight
-        target = None
-        if enemies:
-            target = enemies[0]
-        elif attacker is not None:
-            target = attacker
-        mech_target = target is not None and target["kind"] == "mech"
-        tdist = target.get("_d", 1e9) if target is not None else 1e9
-        engaged = mech_target and (attacker is target or tdist < 55)
-        flee = False
-        if mech_target and not urgent:
-            tx, ty = target["pos"][0], target["pos"][1]
-            away = math.atan2(y - ty, x - tx)
+        if urgent:
             to_c = math.atan2(cc[1] - y, cc[0] - x)
-            # repulsion from every visible mech
-            rx = ry = 0.0
-            for e in enemies:
-                d = max(e["_d"], 5.0)
-                if d < 170:
-                    rx += (x - e["pos"][0]) / d / d
-                    ry += (y - e["pos"][1]) / d / d
-            if rx or ry:
-                away = math.atan2(ry, rx)
-            # never run out of the circle the zone is closing to
-            if dz > cr * 0.6 and abs(wrap(away - to_c)) > 1.4:
-                away = wrap(to_c + (1.4 if wrap(away - to_c) > 0 else -1.4))
-            if hp_frac < 0.5 or len([e for e in enemies if e["_d"] < 120]) >= 2:
-                move_yaw = away
-                flee = True
-            elif engaged:
-                # strafe across their line of fire, drifting away
-                if t - getattr(self, "strafe_t", -9) > 1.3 + random.random():
-                    self.strafe_t = t
-                    self.strafe_s = random.choice((-1, 1))
-                perp = math.atan2(ty - y, tx - x) + self.strafe_s * math.pi / 2
-                move_yaw = math.atan2(math.sin(perp) + 0.6 * math.sin(away), math.cos(perp) + 0.6 * math.cos(away))
-                if target.get("charging"):
-                    move_yaw = perp  # dodge the beam
-            elif tdist < 170:
-                move_yaw = away
+            if move_yaw is None or abs(wrap(move_yaw - to_c)) > 1.2:
+                move_yaw = to_c
+            boost = True
+
         # stuck handling
         if self.last_pos is not None and move_yaw is not None:
             moved = math.dist(self.last_pos[:2], (x, y))
-            self.stuck = self.stuck + 1 if moved < 0.25 else 0
+            self.stuck = self.stuck + 1 if moved < 0.3 else 0
         self.last_pos = (x, y, z)
         jump = False
-        boost = urgent or flee or (engaged and target.get("charging", False))
         if self.unstick > 0:
             self.unstick -= 1
             move_yaw = self.unstick_dir
             jump = me.get("grounded", False)
             boost = True
-        elif self.stuck >= 6 and move_yaw is not None:
-            self.unstick = 8
-            self.unstick_dir = wrap(move_yaw + random.choice((-1.2, 1.2)))
+        elif self.stuck >= 5 and move_yaw is not None:
+            self.unstick = 6
+            self.unstick_dir = wrap(move_yaw + random.choice((-1.3, 1.3)))
             self.stuck = 0
             self.path = []
             self.search = None
-        if me["energy"] < 15 and not urgent:
+            self.strafe_s = -getattr(self, "strafe_s", 1)
+        if me["energy"] < 12 and not urgent:
             boost = False
-        if move_yaw is not None:
-            act["move"] = [math.cos(move_yaw), math.sin(move_yaw)]
-        else:
-            act["move"] = [0.0, 0.0]
+        act["move"] = [math.cos(move_yaw), math.sin(move_yaw)] if move_yaw is not None else [0.0, 0.0]
         act["boost"] = bool(boost and move_yaw is not None)
         act["jump"] = jump
 
-        # aiming and shooting
+        # ----- aim and fire -----
         fire = [False, False]
         aim = None
-        if target is not None:
-            aim, dh = self.lead(me, target, self.gun_speed)
-            err = abs(wrap(me["aim"][0] - aim[0]))
-            tol = math.atan2(3.0, max(dh, 1.0)) + 0.025
-            engage = engaged or tdist < 110 or attacker is not None
-            if target["kind"] == "npc":
-                engage = attacker is target
-            if engage:
-                g0 = weapons[0]
-                if g0 and g0["kind"] == "gun" and err < tol and abs(me["aim"][1] - aim[1]) < 0.1 and dh < g0["stats"].get("range", 230):
-                    fire[0] = g0.get("reload", 0) == 0
-                    if g0.get("ammo", 1) == 0:
-                        act["reload"] = True
-                w1 = weapons[1]
-                if w1:
-                    if w1["kind"] == "laser":
-                        direct = [aim[0], math.atan2(target["pos"][2] + 4.5 - (z + 7), max(dh, 1))]
-                        ch = w1.get("charge", 0)
-                        full = w1["stats"].get("charge", 0.75)
-                        if w1["cooldown"] <= 0 and dh < w1["stats"].get("range", 280):
-                            if ch < full * 0.95:
-                                fire[1] = True
-                            else:
-                                # release when lined up, keep charging otherwise
-                                fire[1] = not (abs(wrap(me["aim"][0] - direct[0])) < tol * 1.2)
-                        if ch > 0:
-                            aim = direct
-                    elif w1["kind"] == "lightning":
-                        if dh < w1["stats"].get("range", 45) * 0.95 and abs(wrap(me["aim"][0] - aim[0])) < 0.4 and me["energy"] > 10:
-                            fire[1] = True
-        elif self.threat and t - self.threat[1] < 4:
+        shoot = target if target is not None else npc_target
+        if recovering and (target is None or target["_d"] > 40):
+            shoot = None
+        if blind_hit and (shoot is None or shoot.get("_d", 0) > 35):
+            shoot = None  # turn to whoever is hitting us from out of sight
+        if shoot is not None:
+            aim, dh = self.lead(me, shoot, self.gun_speed)
+            err_y = abs(wrap(me["aim"][0] - aim[0]))
+            err_p = abs(me["aim"][1] - aim[1])
+            tol = math.atan2(3.2, max(dh, 1.0)) + 0.03
+            g0 = weapons[0]
+            if g0 and g0["kind"] == "gun":
+                if g0.get("ammo", 1) == 0 and g0.get("reload", 0) == 0:
+                    act["reload"] = True
+                elif err_y < tol and err_p < tol + 0.05 and dh < g0["stats"].get("range", 230) * 0.95:
+                    fire[0] = True
+            w1 = weapons[1]
+            if w1:
+                if w1["kind"] == "laser":
+                    direct = [math.atan2(shoot["pos"][1] - y, shoot["pos"][0] - x),
+                              math.atan2(shoot["pos"][2] + 4.5 - (z + 7), max(dh, 1))]
+                    ch = w1.get("charge", 0)
+                    full = w1["stats"].get("charge", 0.75)
+                    if w1["cooldown"] <= 0 and dh < w1["stats"].get("range", 280) * 0.95:
+                        lined = abs(wrap(me["aim"][0] - direct[0])) < math.atan2(2.0, max(dh, 1)) and abs(me["aim"][1] - direct[1]) < 0.05
+                        fire[1] = not (ch >= full * 0.97 and lined)
+                    if ch > 0:
+                        aim = direct
+                elif w1["kind"] == "lightning":
+                    if dh < w1["stats"].get("range", 45) * 0.97 and err_y < 0.45 and me["energy"] > 6:
+                        fire[1] = True
+        elif self.threat and t - self.threat[1] < 4 and not (recovering and not blind_hit):
             aim = [self.threat[0], 0.0]
+        if aim is None and recovering and enemies:
+            e = enemies[0]
+            aim = [math.atan2(e["pos"][1] - y, e["pos"][0] - x), 0.0]  # keep our front toward them
         if aim is None:
-            # look where we walk, otherwise sweep toward the zone center (where others come from)
-            if move_yaw is not None:
-                aim = [move_yaw, 0.0]
-            else:
-                look = math.atan2(nc[1] - y, nc[0] - x) if dist_next > 5 else me["aim"][0]
-                aim = [wrap(look + 0.9 * math.sin(t * 0.35)), 0.0]
+            aim = [move_yaw, 0.0] if move_yaw is not None else [wrap(me["aim"][0] + 0.6), 0.0]
         act["aim"] = aim
         act["fire"] = fire
         return act

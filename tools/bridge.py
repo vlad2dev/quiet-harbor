@@ -30,7 +30,12 @@ async def pump_stderr(proc, path):
 
 async def play_one(args, outdir):
     sid = os.urandom(16).hex()
-    url = f"wss://play.joinbuilders.org/r/{args.room}/play?sid={sid}&name={args.name}"
+    code = ""
+    if args.private:
+        import urllib.request
+        r = json.load(urllib.request.urlopen(f"https://play.joinbuilders.org/mm/code/new?sid={sid}", timeout=5))
+        args.room, code = r["room"], r["code"]
+    url = f"wss://play.joinbuilders.org/r/{args.room}/play?sid={sid}&name={args.name}" + (f"&code={code}" if code else "")
     print("connecting", url, file=sys.stderr)
     msgs = open(outdir / "msgs.jsonl", "a")
     summary = {"room": args.room, "start": time.time()}
@@ -56,12 +61,15 @@ async def play_one(args, outdir):
             except Exception:
                 continue
             t = m.get("type")
-            if t != "obs" or m.get("tick", 0) % 20 == 0:
+            if t != "obs" or m.get("tick", 0) % 20 == 0 or m.get("events"):
                 msgs.write(json.dumps(m)[:20000] + "\n")
             if t == "lobby":
                 you = m.get("you", {})
                 if not you.get("ready"):
                     await ws.send(json.dumps({"type": "ready", "name": args.name}))
+                elif you.get("host") and m.get("phase") == "waiting" and not summary.get("started"):
+                    summary["started"] = True
+                    await ws.send(json.dumps({"type": "start"}))
                 summary["lobby"] = {k: m.get(k) for k in ("phase", "next_at")}
             elif t == "hello":
                 m["map"]["dir"] = str(ROOT / "arena")
@@ -102,8 +110,9 @@ async def main():
     ap.add_argument("--room", type=int, default=0)
     ap.add_argument("--name", default="survivor-test")
     ap.add_argument("--matches", type=int, default=1)
+    ap.add_argument("--private", action="store_true", help="own room: us against the house bots")
     args = ap.parse_args()
-    if not args.room:
+    if not args.room and not args.private:
         import urllib.request
         args.room = json.load(urllib.request.urlopen("https://play.joinbuilders.org/mm/pick?lead=8", timeout=5))["room"]
     for _ in range(args.matches):
