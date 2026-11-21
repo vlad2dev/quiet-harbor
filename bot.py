@@ -13,7 +13,7 @@ import mechfight as mf
 
 CELL = 4.0  # navigation grid, meters
 TICK_BUDGET = 0.012  # seconds of path search per decision
-FLAGS = set(f for f in os.environ.get("FR_FLAGS", "early,agg,aim2,laserseek,econ,drops2,ffa").split(",") if f)  # behaviour switches; env overrides (dev only)
+FLAGS = set(f for f in os.environ.get("FR_FLAGS", "early,aim2,laserseek,econ,drops2,ffa,hunt,burst,gmove").split(",") if f)  # behaviour switches; env overrides (dev only)
 
 
 PARAMS = json.loads(os.environ.get("FR_PARAMS", "{}"))
@@ -572,7 +572,17 @@ class Bot:
             hp = e.get("hp") or e.get("max_hp") or 1400
             frac = hp / max(1.0, e.get("max_hp") or 1400)
             d = e["_d"]
-            if "agg" in FLAGS:
+            if "hunt" in FLAGS:
+                # engage only mechs that matter now: close, shooting us, closing in, weak, aiming at us, or late game
+                vx_, vy_ = (e.get("vel") or [0, 0, 0])[:2]
+                closing_ = (vx_ * (mx - e["pos"][0]) + vy_ * (my - e["pos"][1])) / max(d, 1)
+                eaim = (e.get("aim") or [9.0])[0]
+                aimed = abs(wrap(eaim - math.atan2(my - e["pos"][1], mx - e["pos"][0]))) < 0.22
+                late = getattr(self, "next_r", 999) <= 70 or getattr(self, "alive", 16) <= 3
+                if d > 240 or not (d < 60 or hit_us < 6 or late or (closing_ > 3 and d < 180) or
+                                   (frac < 0.4 and d < 160) or (aimed and d < 190)):
+                    continue
+            elif "agg" in FLAGS:
                 if not (d <= 175 or hit_us < 10):
                     continue
             elif d > 90 and hit_us > 10:
@@ -598,6 +608,120 @@ class Bot:
                 bs, best = s, e
         if best is not None:
             self.tgt_id, self.tgt_t = best["id"], now
+        return best
+
+    def steer(self, me, target, enemies, zone, t, want_los, goal_yaw, goal_w, rmin, rmax, perp_w):
+        """Score 16 headings plus 'stand' each decision: goal alignment, walls, zone, strafe, peek
+        (be in line of fire when a weapon is ready, out of it when not), exposure to other threats, smoothing.
+        Returns a yaw or None (stand)."""
+        g = self.grid
+        x, y, z = me["pos"]
+        sp = me.get("stats", {}).get("walk_speed", 11.7)
+        tx, ty, tz = target["pos"]
+        d = math.hypot(tx - x, ty - y)
+        to_t = math.atan2(ty - y, tx - x)
+        th = tz + 4.5 * (1 + 0.05 * (target.get("cubes") or 0))
+        mh = me.get("stats", {}).get("muzzle_height", 7)
+        others = [e for e in enemies if e is not target and e["_d"] < 200][:3]
+        cc, cr = self.zone_at(zone, t + 1.0)
+        last = getattr(self, "steer_last", None)
+        if t >= getattr(self, "steer_flip", -1):
+            self.steer_flip = t + 0.45 + 0.7 * random.random()
+            self.steer_side = -getattr(self, "steer_side", 1)
+        side = getattr(self, "steer_side", 1)
+        perp = to_t + side * math.pi / 2
+        best, bs = None, -1e9
+        for k in range(17):
+            if k == 16:
+                yaw, step1, step2 = None, 0.0, 0.0
+            else:
+                yaw = k * math.pi / 8
+                step1, step2 = sp * 0.45, sp * 1.0
+            cx, cy = (math.cos(yaw), math.sin(yaw)) if yaw is not None else (0.0, 0.0)
+            p1x, p1y = x + cx * step1, y + cy * step1
+            p2x, p2y = x + cx * step2, y + cy * step2
+            sc = 0.0
+            if goal_yaw is not None and yaw is not None:
+                sc += goal_w * math.cos(yaw - goal_yaw)
+            if yaw is not None and g.blocked[g.cell(p1x, p1y)] == 1:
+                sc -= 6.0
+            if math.hypot(p2x - cc[0], p2y - cc[1]) > cr - 3:
+                sc -= 2.5
+            if yaw is not None:
+                sc += perp_w * math.cos(yaw - perp)
+                # keep the preferred band
+                nd = math.hypot(tx - p2x, ty - p2y)
+                if nd < rmin:
+                    sc -= (rmin - nd) / 10.0
+                elif nd > rmax:
+                    sc -= (nd - rmax) / 10.0
+            if want_los:
+                l1 = g.fire_clear(p1x, p1y, g.height(p1x, p1y) + mh, tx, ty, th)
+                l2 = g.fire_clear(p2x, p2y, g.height(p2x, p2y) + mh, tx, ty, th) if yaw is not None else l1
+                sc += want_los * ((1.3 if l1 else -1.3) + (0.6 if l2 else -0.6))
+            for e in others:
+                if g.los(p1x, p1y, e["pos"][0], e["pos"][1]):
+                    sc -= 0.45
+            if last is not None and yaw is not None:
+                sc += 0.15 * math.cos(yaw - last)
+            if sc > bs:
+                bs, best = sc, yaw
+        self.steer_last = best
+        return best
+
+    def gmove(self, me, target, enemies, zone, t, ready, pref, near_cube):
+        """Fight movement: score standing still and 16 steps of 6 m. Line of fire to the target is worth a lot
+        when a weapon is ready (hiding when not), being seen by other mechs costs, keep the preferred range,
+        stay off walls and inside the zone, strafe, and drift toward a nearby cube."""
+        g = self.grid
+        x, y, z = me["pos"]
+        tx, ty, tz = target["pos"]
+        th = tz + 4.5 * (1 + 0.05 * (target.get("cubes") or 0))
+        mh = me.get("stats", {}).get("muzzle_height", 7)
+        want_los = 1.0 if ready else -1.0
+        others = [e for e in enemies if e is not target and e["_d"] < 170][:4]
+        cc, cr = self.zone_at(zone, t + 1.0)
+        if t >= getattr(self, "gm_flip", -1):
+            self.gm_flip = t + 0.3 + 0.7 * random.random()
+            if random.random() < 0.6:
+                self.gm_side = -getattr(self, "gm_side", 1)
+        side = getattr(self, "gm_side", 1)
+        to_t = math.atan2(ty - y, tx - x)
+        perp = to_t + side * math.pi / 2
+        best, bs = None, -1e18
+        for k in range(17):
+            if k == 16:
+                px, py, step, yaw = x, y, 0.0, None
+            else:
+                yaw = k * math.pi / 8
+                px, py, step = x + math.cos(yaw) * 6.0, y + math.sin(yaw) * 6.0, 6.0
+                if g.blocked[g.cell(px, py)] == 1 or g.blocked[g.cell(x + math.cos(yaw) * 3.0, y + math.sin(yaw) * 3.0)] == 1:
+                    continue
+            nd = math.hypot(tx - px, ty - py)
+            sc = -1.1 * abs(nd - pref) - 0.4 * step
+            los = g.fire_clear(px, py, g.height(px, py) + mh, tx, ty, th)
+            if los:
+                sc += 45 * want_los
+            for e in others:
+                ex, ey, ez = e["pos"]
+                if g.fire_clear(ex, ey, ez + 8, px, py, g.height(px, py) + 5.4, skip_end=1.0):
+                    sc -= 30
+            dz = math.hypot(px - cc[0], py - cc[1])
+            if dz > cr - 5:
+                sc -= 10 + (dz - cr + 5) * 2
+            if g.soft[g.cell(px, py)] == 2:
+                sc -= 2.5 * 2  # hugging a wall: little room to move
+            if yaw is not None and want_los > 0:
+                sc += 9 * math.cos(yaw - perp)
+            if near_cube is not None and near_cube[0] < 40 and yaw is not None:
+                cp = near_cube[1]
+                sc += 1.5 * (near_cube[0] - math.hypot(cp[0] - px, cp[1] - py))
+            if yaw is None:
+                sc -= 8
+                if want_los < 0 and not los:
+                    sc += 14
+            if sc > bs:
+                bs, best = sc, yaw
         return best
 
     def tactical(self, me, target, enemies, want, ready, hp_frac):
@@ -871,6 +995,7 @@ class Bot:
             log("stats", t, json.dumps(st))
         self.now = t
         self.mypos = (x, y)
+        self.next_r = obs["zone"]["next_radius"]
         _mv = me.get("vel", [0, 0, 0])
         self.muzzle = (x + _mv[0] * 0.1, y + _mv[1] * 0.1, z + me.get("stats", {}).get("muzzle_height", 7))
         enemies, npcs = self.seen(obs, me)
@@ -933,6 +1058,8 @@ class Bot:
         heal_to = HEAL_TO_EARLY if "early" in FLAGS else HEAL_TO
         if "agg" in FLAGS:
             heal_below, heal_to = AGG_HEAL_BELOW, AGG_HEAL_TO  # fight on while healthy; come back once three quarters healed
+        if "burst" in FLAGS and not getattr(self, "ffa", False):
+            heal_below, heal_to = 0.0, 0.0
         if hp_frac < heal_below and near > 60 and not weak_target:
             self.recovering = True
         if t < getattr(self, "hide_until", -1) and hp_frac < heal_to and near > 45:
@@ -1130,8 +1257,20 @@ class Bot:
                                             or (outgunned and hp_frac < AGG_OUTGUNNED_HP))
                 if ffa_on and not finishing and nthreat >= 2 and hp_frac < 0.8:
                     losing = True
+            if "burst" in FLAGS:
+                # retreat only in short bursts after the last losing tick; no long heals
+                near_n = len([e for e in enemies if e["_d"] < 160])
+                lose_now = ((near_n >= 2 and hp_frac < 0.55) or (near_n >= 3 and hp_frac < 0.8) or
+                            (hp_frac < 0.35 and efrac > hp_frac + 0.1))
+                if efrac < 0.25 and hp_frac > 0.2 and near_n <= 2:
+                    lose_now = False
+                if ffa_on and nthreat >= 2 and hp_frac < 0.8:
+                    lose_now = True
+                if lose_now:
+                    self.burst_until = t + 1.5
+                losing = t < getattr(self, "burst_until", -1)
             outnumbered = False
-            if losing:
+            if losing and "burst" not in FLAGS:
                 self.hide_until = t + 6
             if t >= getattr(self, "strafe_next", -1):
                 self.strafe_next = t + STRAFE_MIN + STRAFE_JITTER * random.random()
@@ -1179,6 +1318,39 @@ class Bot:
                     mx = math.cos(perp) + radial * math.cos(to_t)
                     my = math.sin(perp) + radial * math.sin(to_t)
                 move_yaw = math.atan2(my, mx)
+                if "gmove" in FLAGS and self.grid is not None:
+                    lw_ = w1 if (w1 and w1["kind"] == "laser") else None
+                    gun_ok = bool(g0 and g0.get("ammo", 1) > 0 and g0.get("reload", 0) <= 0.25 and
+                                  d <= g0["stats"].get("range", 230) - 10)
+                    # holding a laser or lightning always counts as ready while hunting
+                    rdy = gun_ok or bool(lw_) or has_lightning
+                    pref = 28.0 if (has_lightning and me["energy"] > 12) else (120.0 if has_laser else 85.0)
+                    if not has_lightning and "lightning" in (target.get("weapons") or []):
+                        pref = max(pref, 64.0)
+                    if efrac < 0.38 and hp_frac > 0.42 and nthreat <= 2:
+                        pref = 20.0  # close in to finish
+                    gy_ = self.gmove(me, target, enemies, zone, t, rdy, pref, near_cube)
+                    move_yaw = gy_
+                if "steer" in FLAGS and self.grid is not None:
+                    # weapon readiness decides whether we want to be seen (peek) or hidden (duck)
+                    lw = w1 if (w1 and w1["kind"] == "laser") else None
+                    gun_ready = bool(g0 and g0.get("ammo", 1) > 0 and g0.get("reload", 0) <= 0.25)
+                    laser_ready = bool(lw and (lw.get("charge", 0) or 0) >= lw["stats"].get("charge", 0.75) - 0.3 and
+                                       d < lw["stats"].get("range", 280))
+                    light_ready = bool(w1 and w1["kind"] == "lightning" and d < w1["stats"].get("range", 45))
+                    wl = 1.0 if (gun_ready or laser_ready or light_ready) else -1.0
+                    taim_ = (target.get("aim") or [9.0])[0]
+                    if target.get("charging") and abs(wrap(taim_ - math.atan2(y - ty, x - tx))) < 0.25 and not laser_ready:
+                        wl = -1.6
+                    if has_lightning:
+                        rmin, rmax = 12.0, 36.0
+                    elif has_laser:
+                        rmin, rmax = 125.0, 185.0
+                    else:
+                        rmin, rmax = 45.0, 85.0
+                    gy = to_t if d > rmax + 4 else (wrap(to_t + math.pi) if d < rmin - 4 else None)
+                    move_yaw = self.steer(me, target, enemies, zone, t, wl, gy, 1.0, rmin, rmax,
+                                          0.7 if target.get("_lof", True) else 0.2)
                 # boosting is loud (90 m) and drains energy: only to close in with lightning
                 if has_lightning and want + 15 < d < 90 and me["energy"] > CHARGE_ENERGY:
                     boost = True
