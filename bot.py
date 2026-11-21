@@ -13,7 +13,7 @@ import mechfight as mf
 
 CELL = 4.0  # navigation grid, meters
 TICK_BUDGET = 0.012  # seconds of path search per decision
-FLAGS = set(f for f in os.environ.get("FR_FLAGS", "early,aim2,laserseek,econ,drops2,ffa,hunt,burst").split(",") if f)  # behaviour switches; env overrides (dev only)
+FLAGS = set(f for f in os.environ.get("FR_FLAGS", "early,agg,aim2,laserseek,econ,drops2,ffa,burst").split(",") if f)  # behaviour switches; env overrides (dev only)
 
 
 PARAMS = json.loads(os.environ.get("FR_PARAMS", "{}"))
