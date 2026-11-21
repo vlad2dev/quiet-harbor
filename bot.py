@@ -13,7 +13,7 @@ import mechfight as mf
 
 CELL = 4.0  # navigation grid, meters
 TICK_BUDGET = 0.012  # seconds of path search per decision
-FLAGS = set(f for f in os.environ.get("FR_FLAGS", "early,agg,aim2,laserseek,econ,drops2,ffa,burst").split(",") if f)  # behaviour switches; env overrides (dev only)
+FLAGS = set(f for f in os.environ.get("FR_FLAGS", "early,aim2,laserseek,econ,drops2,ffa,hunt,burst,gmove,laserup").split(",") if f)  # behaviour switches; env overrides (dev only)
 
 
 PARAMS = json.loads(os.environ.get("FR_PARAMS", "{}"))
@@ -50,6 +50,7 @@ CHARGE_ENERGY = PARAMS.get("charge_energy", 70)
 CUBE_RADIUS = PARAMS.get("cube_radius", 90)
 BOOST_FLOOR = PARAMS.get("boost_floor", 12)
 LASER_WIDTH = PARAMS.get("laser_width", 2.0)
+LASER_AIM_FRACTION = PARAMS.get("laser_aim_fraction", 0.0)
 LASER_PITCH = PARAMS.get("laser_pitch", 0.05)
 
 
@@ -383,6 +384,7 @@ class Bot:
         self.stuck = 0
         self.unstick = 0
         self.unstick_dir = 0.0
+        self.failed_goal = None
         self.threat = None  # (bearing, time)
         self.last_t = 0.0
         self.laser_chase = None
@@ -447,6 +449,8 @@ class Bot:
         g = self.grid
         if g is None or self.goal is None:
             return
+        if "jetescape" in FLAGS:
+            self.planned_at = self.now
         start = g.nearest_free(g.cell(me["pos"][0], me["pos"][1]))
         goal = g.nearest_free(g.cell(self.goal[0], self.goal[1]))
         if self.search is None or self.search.goal != goal:
@@ -456,6 +460,8 @@ class Bot:
         if not self.search.done:
             self.search.step(deadline)
         if self.search.done:
+            if "jetescape" in FLAGS:
+                self.failed_goal = self.goal_key if not self.search.path and not self.search.open else None
             self.path = self.search.path or []
             self.path_i = 0
             self.search_done_goal = goal
@@ -516,6 +522,85 @@ class Bot:
         npcs.sort(key=lambda m: m["_d"])
         return mechs, npcs
 
+    def facing_error(self, enemy):
+        aim = enemy.get("aim")
+        if not aim:
+            return None
+        ex, ey = enemy["pos"][:2]
+        return abs(wrap(aim[0] - math.atan2(self.mypos[1] - ey, self.mypos[0] - ex)))
+
+    def opening_threat(self, enemy, hurt_by, now):
+        if enemy["_d"] < 60 or now - hurt_by.get(enemy["id"], -99) < 4:
+            return True
+        if enemy["_d"] >= 120:
+            return False
+        if (enemy.get("hp") or 1400) < 350:
+            return True
+        error = self.facing_error(enemy)
+        return enemy.get("charging") and error is not None and error < 0.22
+
+    def duel_candidates(self, enemies, me, hp, t):
+        """Keep one opponent through a duel, then require a quiet repair before reopening."""
+        active = getattr(self, "duel_id", None)
+        hit_by = getattr(self, "hurt_by", {})
+        threats = {e["id"] for e in enemies if e["_d"] < 130}
+        threats.update(i for i, when in hit_by.items() if isinstance(i, int) and i < 16 and t - when < 4)
+        if hp < 0.5 or len(threats) > 1:
+            self.duel_rest = True
+        if getattr(self, "duel_rest", False):
+            self.duel_id = None
+            if hp < 0.98 or len(threats) > 1 or t - getattr(self, "last_hurt", -99) < 5:
+                return []
+            self.duel_rest = False
+        for e in enemies:
+            if e["id"] == active and e["_d"] <= 145:
+                return [e]
+        self.duel_id = None
+        if hp < 0.9:
+            self.duel_rest = True
+            return []
+        armed = any(w and w["kind"] == "laser" for w in me["weapons"])
+        return [e for e in enemies if e["_d"] <= (115 if armed else 90) and
+                (not threats or e["id"] in threats)]
+
+    def patrol_point(self, me, zone, enemies):
+        center, r = zone["next_center"], zone["next_radius"]
+        if r <= 25.5:
+            return center
+        phase = math.atan2(me["pos"][1] - center[1], me["pos"][0] - center[0])
+        best, cost = center, math.inf
+        for step in (1, -1, 2, -2, 3, -3, 4, -4):
+            yaw = phase + step * math.pi / 6
+            pt = (center[0] + 0.5*r*math.cos(yaw), center[1] + 0.5*r*math.sin(yaw))
+            if self.grid and not self.grid.free(self.grid.cell(*pt)):
+                continue
+            near = min((math.dist(pt, e["pos"][:2]) for e in enemies), default=115)
+            score = abs(near - 115) + 0.25 * math.dist(pt, me["pos"][:2])
+            if score < cost:
+                best, cost = pt, score
+        return best
+
+    def hunt_target(self, e, me, t):
+        d = e["_d"]
+        if d > 240:
+            return False
+        if d < 60 or t - getattr(self, "hurt_by", {}).get(e["id"], -99) < 6:
+            return True
+        if d < 160 and (e.get("hp") or 1400) < 0.4 * (e.get("max_hp") or 1400):
+            return True
+        error = self.facing_error(e)
+        if d < 190 and error is not None and error < 0.22:
+            return True
+        vx, vy = (e.get("vel") or (0, 0))[:2]
+        mx, my = (me.get("vel") or (0, 0))[:2]
+        ex, ey = e["pos"][:2]
+        closing = ((vx - mx) * (self.mypos[0] - ex) + (vy - my) * (self.mypos[1] - ey)) / max(1, d)
+        return d < 180 and closing > 3
+
+    def showing_back(self, enemy):
+        error = self.facing_error(enemy)
+        return error is not None and error > math.pi / 2
+
     def choose_target(self, enemies):
         """Weakest effective target: low hp, close, or the one shooting us.
 
@@ -524,6 +609,8 @@ class Bot:
         best, bs = None, 1e18
         hurt_by = getattr(self, "hurt_by", {})
         now = getattr(self, "now", 0.0)
+        if "opening" in FLAGS and now < 20:
+            enemies = [e for e in enemies if self.opening_threat(e, hurt_by, now)]
         if "aim2" in FLAGS and self.grid is not None and getattr(self, "muzzle", None) is not None:
             return self.choose_target_lof(enemies, hurt_by, now)
         ffa = getattr(self, "ffa", False) and getattr(self, "alive", 16) > 4
@@ -544,6 +631,8 @@ class Bot:
                     continue
             hp = e.get("hp") or e.get("max_hp") or 1400
             s = hp + DISTANCE_WEIGHT * e["_d"]
+            if "backstab" in FLAGS and self.showing_back(e):
+                s -= 60 * DISTANCE_WEIGHT
             if self.threat and e["id"] == self.threat[2]:
                 s -= ATTACKER_BONUS
             if s < bs:
@@ -583,16 +672,18 @@ class Bot:
                                    (frac < 0.4 and d < 160) or (aimed and d < 190)):
                     continue
             elif "agg" in FLAGS:
-                if not (d <= 175 or hit_us < 10):
+                if not (getattr(self, "hunt_on", False) or d <= 175 or hit_us < 10):
                     continue
             elif d > 90 and hit_us > 10:
                 continue
-            if ffa and not (hit_us < 5 or d < 45 or (frac < 0.35 and d < 120)):
+            if ffa and not ("duel" in FLAGS and getattr(self, "ffa", False)) and not (hit_us < 5 or d < 45 or (frac < 0.35 and d < 120)):
                 continue
             h = self.lof_height(e) if d < 260 else None
             e["_aimh"] = h if h is not None else 4.5 * (1 + 0.05 * (e.get("cubes") or 0))
             e["_lof"] = h is not None
             s = d + 0.18 * hp
+            if "backstab" in FLAGS and self.showing_back(e):
+                s -= 60
             if frac <= 0.3:
                 s -= 200
             if e["id"] == last_id and now - last_t < 2:
@@ -797,6 +888,47 @@ class Bot:
                     best, bd = (px, py), d
         return best
 
+    def hear_weapons(self, obs, me, t):
+        x, y = me["pos"][:2]
+        for sound in sorted(obs.get("sounds", []), key=lambda s: s.get("age", 0), reverse=True):
+            kind = sound["kind"]
+            if kind not in ("gun", "laser", "laser_charge") or sound["dist"] not in ("near", "mid"):
+                continue
+            yaw = sound["bearing"]
+            # Match both the noisy bearing and the distance band to visible possible sources.
+            visible = any(abs(wrap(math.atan2(e["pos"][1] - y, e["pos"][0] - x) - yaw)) < 0.35 and
+                          ((e["_d"] < 60) == (sound["dist"] == "near")) and e["_d"] < 160
+                          for e in obs["mechs"])
+            if visible:
+                continue
+            when = t - sound.get("age", 0)
+            self.heard_weapon = (yaw, when)
+            if kind == "laser_charge":
+                self.heard_charge = (yaw, when)
+
+    def escape_pocket(self, me, t):
+        if not self.grid or getattr(self, "planned_at", None) != t or not self.goal:
+            self.escape_watch = None
+            return None
+        x, y = me["pos"][:2]
+        d = math.dist((x, y), self.goal)
+        watch = getattr(self, "escape_watch", None)
+        if d <= 20:
+            self.escape_watch = None
+            return None
+        if watch is None or self.goal_key != watch[0] or d <= watch[1] - 2.5:
+            self.escape_watch = (self.goal_key, d, t)
+        elif t - watch[2] >= 3 and me["energy"] > 20:
+            # An exhausted A* search plus a local wall distinguishes an enclosed route from a slow turn.
+            yaw = math.atan2(self.goal[1] - y, self.goal[0] - x)
+            if self.failed_goal == self.goal_key and self.blocked_line(x, y, x + 16*math.cos(yaw), y + 16*math.sin(yaw)):
+                self.jet_yaw = yaw
+                self.jet_until = t + 2
+                self.escape_watch = (self.goal_key, d, t)
+        if t < getattr(self, "jet_until", -1) and me["energy"] > 5:
+            return self.jet_yaw
+        return None
+
     def dodge(self, obs, me):
         """Sideways escape from bullets about to hit us and from mortar landing spots; (dx, dy) or None."""
         x, y, z = me["pos"]
@@ -935,11 +1067,13 @@ class Bot:
                 bd, best = d, dr
         return best
 
-    def upgrade_pick(self, offer):
+    def upgrade_pick(self, offer, has_laser=False):
         pref = ["plating", "armor", "nanites", "laser_damage", "laser_charge", "lightning_efficiency", "gun_damage",
                 "gun_rate", "lightning_chain", "lightning_range", "gun_mag", "servos", "gyros", "capacitor",
                 "reactor", "gun_velocity", "jets", "sensors"]
         pref = UPGRADE_FIRST + pref
+        if "laserup" in FLAGS and has_laser:
+            pref = ["laser_damage", "laser_charge"] + pref
         ids = [c["id"] for c in offer["choices"]]
         for p in pref:
             if p in ids:
@@ -959,7 +1093,7 @@ class Bot:
         weapons = me["weapons"]
         kinds = [w["kind"] if w else None for w in weapons]
         if obs.get("offer"):
-            act["pick"] = self.upgrade_pick(obs["offer"])
+            act["pick"] = self.upgrade_pick(obs["offer"], "laser" in kinds)
 
         for ev in obs.get("events", []):
             if ev.get("type") == "damaged" and ev.get("bearing") is not None:
@@ -970,6 +1104,9 @@ class Bot:
                 self.last_dealt = t
             if ev.get("type") == "kill" and ev.get("target", 99) < 16:
                 self.my_kills = getattr(self, "my_kills", 0) + 1
+                if "duel" in FLAGS and getattr(self, "ffa", False):
+                    self.kill_loot = getattr(self, "lastseen", {}).get(ev["target"], (None, t))[0]
+                    self.kill_loot_until = t + 7
             if ev.get("type") == "kill" and "postkill" in FLAGS and ev.get("target", 99) < 16:
                 self.hide_until = t + 5  # a kill wakes the next hunter and our gunfire drew others: reset first
         # accuracy instrumentation (stderr only)
@@ -1015,7 +1152,25 @@ class Bot:
         has_lightning = "lightning" in kinds
 
         # ----- target -----
-        target = self.choose_target(enemies)
+        candidates = enemies
+        self.hunt_on = ("huntgate" in FLAGS and "aim2" in FLAGS and "agg" in FLAGS and
+                        t >= 20 and not getattr(self, "ffa", False))
+        if self.hunt_on:
+            if nr <= 70 or obs.get("alive", 16) <= 3:
+                candidates = [e for e in enemies if e["_d"] <= 240]
+            else:
+                candidates = [e for e in enemies if self.hunt_target(e, me, t)]
+        duel = "duel" in FLAGS and getattr(self, "ffa", False)
+        camp = "camp" in FLAGS and getattr(self, "ffa", False)
+        if duel:
+            candidates = self.duel_candidates(enemies, me, hp_frac, t)
+        elif camp:
+            candidates = [e for e in candidates if e["_d"] < 55 or
+                          t - getattr(self, "hurt_by", {}).get(e["id"], -99) < 4 or
+                          (e["_d"] < 100 and (e.get("hp") or 1400) < 0.3*(e.get("max_hp") or 1400))]
+        target = self.choose_target(candidates)
+        if duel and target is not None:
+            self.duel_id = target["id"]
         attacker = None
         if self.threat and t - self.threat[1] < 3:
             for m in obs["mechs"]:
@@ -1071,9 +1226,15 @@ class Bot:
         king = "king" in FLAGS and nr <= 25.5
         drop = self.pick_drop(obs, me, zone, t, enemies)
         station = "drops2" in FLAGS and drop is not None and not urgent
-        if king or station:
+        finish_close = ("finisher" in FLAGS and target is not None and hp_frac > 0.42 and
+                        (target.get("hp") or 1400) < 0.38 * (target.get("max_hp") or 1400) and
+                        sum(e["_d"] < 160 for e in enemies) <= 2)
+        if king or station or finish_close:
             recovering = False
-        if recovering:
+        resting = duel and getattr(self, "duel_rest", False)
+        if duel:
+            recovering = resting and not urgent
+        if recovering or (camp and enemies):
             npc_target = None
 
         # ----- loot -----
@@ -1150,6 +1311,10 @@ class Bot:
                 self.last_mech_t = t
                 last_mech = t
             calm = t - last_mech > 6 and hp_frac >= 0.85 and me["in_zone"] and me.get("cubes", 0) < 14
+            if "farm5" in FLAGS:
+                # farm whenever nobody is fighting us and we are above half HP
+                calm = (target is None and t - getattr(self, "last_hurt", -99) > 3 and hp_frac > 0.5 and
+                        me["in_zone"] and me.get("cubes", 0) < 14)
             if calm and fm:
                 best_f = min(fm.values(), key=lambda v: math.dist(v[0][:2], (x, y)))
                 fd = math.dist(best_f[0][:2], (x, y))
@@ -1184,10 +1349,34 @@ class Bot:
                 self.cover_t = t
                 self.cover_pt = self.find_cover(me, enemies[:3])
             cover = self.cover_pt
-        if king:
+        if resting and not urgent and not station:
+            if cover is not None:
+                if math.dist((x, y), cover) > 3:
+                    move_yaw = math.atan2(cover[1]-y, cover[0]-x)
+            elif enemies:
+                move_yaw = math.atan2(y-enemies[0]["pos"][1], x-enemies[0]["pos"][0])
+        elif duel and not urgent and not resting and t < getattr(self, "kill_loot_until", -1) and near > 60 and self.kill_loot:
+            cp = self.kill_loot
+            nearby = [pos for pos, _ in cmem.values() if math.dist(pos[:2], cp[:2]) < 25]
+            dest = min(nearby, key=lambda pos: math.dist(pos[:2], (x, y))) if nearby else cp
+            move_yaw = self.route_to(me, dest, deadline)
+            if not nearby and math.dist(dest[:2], (x, y)) < 4:
+                self.kill_loot_until = t
+        elif duel and not urgent and self.alive <= 4 and not resting:
+            if t >= getattr(self, "patrol_at", 0) or math.dist(self.patrol, (x, y)) < 4:
+                self.patrol = self.patrol_point(me, zone, enemies)
+                self.patrol_at = t + 2
+            move_yaw = self.route_to(me, self.patrol, deadline)
+        elif camp and not urgent and target is None and (laser is None or near < 110):
+            if t >= getattr(self, "camp_at", 0):
+                hazards = [(e["pos"][0], e["pos"][1], 75) for e in enemies[:3]]
+                self.camp_goal = self.pick_goal(me, zone, hazards)
+                self.camp_at = t + 4
+            move_yaw = self.route_to(me, self.camp_goal, deadline)
+        elif king:
             move_yaw = self.route_to(me, nc, deadline)
             boost = math.dist((x, y), self.goal) > 30
-        elif laser is not None:
+        elif laser is not None and not resting and not (duel and target is not None):
             move_yaw = self.route_to(me, laser, deadline)
             boost = (bool(enemies) or hurt_recently) and math.dist((x, y), laser[:2]) > 20 and me["energy"] > 30
         elif station:
@@ -1269,6 +1458,16 @@ class Bot:
                 if lose_now:
                     self.burst_until = t + 1.5
                 losing = t < getattr(self, "burst_until", -1)
+            if duel:
+                losing = False  # duel_candidates handles the disengage and repair latch
+                want = 32 if has_lightning else (95 if has_laser else 78)
+                if self.alive <= 4 and has_laser:
+                    want = 110
+                if efrac < 0.3:
+                    want = min(want, 45)
+            if finish_close:
+                losing = False
+                want = 20
             outnumbered = False
             if losing and "burst" not in FLAGS:
                 self.hide_until = t + 6
@@ -1358,7 +1557,9 @@ class Bot:
                 if target.get("charging") and abs(wrap(taim - math.atan2(y - ty, x - tx))) < 0.25:
                     move_yaw = perp  # its laser is lined up on us: break the line
                     boost = me["energy"] > (45 if has_lightning else 10)
-                if near_cube is not None and near_cube[0] < (70 if hp_frac > 0.5 else 40):
+                if finish_close and d > 23 and not target.get("charging"):
+                    move_yaw = self.route_to(me, target["pos"], deadline) if not target.get("_lof", True) else to_t
+                elif near_cube is not None and near_cube[0] < (70 if hp_frac > 0.5 else 40):
                     cp = near_cube[1]
                     move_yaw = math.atan2(cp[1] - y, cp[0] - x)
         elif drop is not None and not urgent and not recovering:
@@ -1393,6 +1594,12 @@ class Bot:
                 move_yaw = to_n + math.pi / 2 * (1 if int(t / 2) % 2 else -1)
         elif detour is not None:
             move_yaw = math.atan2(detour[1] - y, detour[0] - x)
+        elif "opening" in FLAGS and t < 20 and enemies and self.grid and not urgent:
+            if t >= getattr(self, "opening_cover_at", 0):
+                self.opening_cover = self.find_cover(me, enemies[:2])
+                self.opening_cover_at = t + 0.6
+            if self.opening_cover and math.dist((x, y), self.opening_cover) > 3:
+                move_yaw = math.atan2(self.opening_cover[1] - y, self.opening_cover[0] - x)
         else:
             key = (round(nc[0]), round(nc[1]), round(nr))
             if self.goal is None or self.goal_key != key:
@@ -1420,6 +1627,13 @@ class Bot:
                 move_yaw = pyaw
             boost = True
 
+        if "hearing" in FLAGS:
+            self.hear_weapons(obs, me, t)
+            charge_yaw, charge_t = getattr(self, "heard_charge", (0, -99))
+            if t - charge_t < 0.65 and not urgent:
+                side = 1 if move_yaw is None or math.sin(move_yaw - charge_yaw) >= 0 else -1
+                move_yaw = charge_yaw + side * math.pi / 2
+                slow = False
         dv = self.dodge(obs, me)
         if dv is not None:
             bx, by = (math.cos(move_yaw) * 0.3, math.sin(move_yaw) * 0.3) if move_yaw is not None else (0.0, 0.0)
@@ -1433,7 +1647,10 @@ class Bot:
             self.stuck = self.stuck + 1 if moved < 0.3 else 0
         self.last_pos = (x, y, z)
         jump = False
-        if self.unstick > 0:
+        jet = self.escape_pocket(me, t) if "jetescape" in FLAGS else None
+        if jet is not None:
+            move_yaw, jump, boost, slow = jet, me.get("grounded", False), True, False
+        elif self.unstick > 0:
             self.unstick -= 1
             move_yaw = self.unstick_dir
             jump = me.get("grounded", False) and me["energy"] > 10  # an empty tank only wastes the jump
@@ -1460,7 +1677,7 @@ class Bot:
         fire = [False, False]
         aim = None
         shoot = target if target is not None else npc_target
-        if recovering and target is None:
+        if resting or (recovering and target is None):
             shoot = None
         if "heal" in FLAGS and recovering and t - getattr(self, "last_hurt", -99) > 1.5 and                 (target is None or target["_d"] > 45):
             shoot = None  # any hit we deal restarts the 5 s regen timer  # retreating changes where we go, never whether we shoot back at a mech
@@ -1519,15 +1736,21 @@ class Bot:
                                 # release early when the partial beam already kills (assume worst-case armor)
                                 dmg = (w1["stats"].get("damage", 315) * (1 + 0.04 * min(10, me.get("cubes", 0))) *
                                        (0.35 + 0.65 * ch / full) * 0.76)
+                                if "backstab" in FLAGS and self.showing_back(shoot):
+                                    dmg *= 1.5
                                 ready_ = dmg >= (shoot.get("hp") or 1400) + 15
                         fire[1] = not (ready_ and lined)
-                    if ch > 0:
+                    if ch > full * LASER_AIM_FRACTION:
                         aim = direct
                 elif w1["kind"] == "lightning":
                     if dh < w1["stats"].get("range", 45) * 0.97 and err_y < 0.45 and me["energy"] > 6:
                         fire[1] = True
         elif self.threat and t - self.threat[1] < 4 and not (recovering and not blind_hit):
             aim = [self.threat[0], 0.0]
+        if "hearing" in FLAGS and aim is None and target is None:
+            yaw, when = getattr(self, "heard_weapon", (0, -99))
+            if t - when < 0.8:
+                aim = [yaw, 0.0]
         if aim is None and recovering and enemies:
             e = enemies[0]
             aim = [math.atan2(e["pos"][1] - y, e["pos"][0] - x), 0.0]  # keep our front toward them
