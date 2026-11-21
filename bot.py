@@ -503,27 +503,41 @@ class Bot:
             d = math.dist(c["pos"][:2], (x, y))
             if abs(c["pos"][2] - z) < 5 and d < (70 if quiet else 25):
                 cands.append((d, c["pos"]))
+        # remember weapon pickups we have seen; forget ones that are gone when we look at their spot
+        mem = self.__dict__.setdefault("pickmem", {})
+        seen_ids = set()
         for p in obs.get("pickups", []):
-            if abs(p["pos"][2] - z) > 5 or p["kind"] in kinds:
+            mem[p["id"]] = (p["kind"], p["pos"])
+            seen_ids.add(p["id"])
+        for pid in list(mem):
+            if pid not in seen_ids and math.dist(mem[pid][1][:2], (x, y)) < 30:
+                del mem[pid]
+
+        def want_kind(k):
+            if k == "laser":
+                return kinds[1] != "laser"
+            if k == "lightning":
+                return kinds[1] in (None, "mortar")
+            return False
+
+        for pid, (k, pos) in mem.items():
+            if abs(pos[2] - z) > 5 or not want_kind(k):
                 continue
-            if p["kind"] in ("lightning", "laser") and kinds[1] in (None, "mortar"):
-                d = math.dist(p["pos"][:2], (x, y))
-                bonus = 70 if p["kind"] == "laser" else 40
-                if d < ((220 if p["kind"] == "laser" else 160) if quiet else 30):
-                    cands.append((d - bonus, p["pos"]))
+            d = math.dist(pos[:2], (x, y))
+            bonus = 80 if k == "laser" else 40
+            if d < ((260 if k == "laser" else 160) if quiet else 30):
+                cands.append((d - bonus, pos))
         if cands and not urgent:
             cands.sort(key=lambda c: c[0])
             detour = cands[0][1]
         for p in obs.get("pickups", []):
-            if math.dist(p["pos"][:2], (x, y)) < self.reach and abs(p["pos"][2] - z) < 4 and p["kind"] not in kinds:
-                if p["kind"] in ("lightning", "laser"):
-                    if kinds[1] is None:
-                        act["take"] = p["id"]
-                        break
-                    if kinds[1] == "mortar":
-                        act["take"] = p["id"]
-                        act["drop"] = 1
-                        break
+            if math.dist(p["pos"][:2], (x, y)) < self.reach and abs(p["pos"][2] - z) < 4 and want_kind(p["kind"]):
+                if kinds[1] is None:
+                    act["take"] = p["id"]
+                elif not (weapons[1] and weapons[1].get("charge", 0) > 0):
+                    act["take"] = p["id"]
+                    act["drop"] = 1
+                break
 
         # ----- movement -----
         move_yaw = None
@@ -671,7 +685,9 @@ class Bot:
             e = enemies[0]
             aim = [math.atan2(e["pos"][1] - y, e["pos"][0] - x), 0.0]  # keep our front toward them
         if aim is None:
-            aim = [move_yaw, 0.0] if move_yaw is not None else [wrap(me["aim"][0] + 0.6), 0.0]
+            # sweep the 120 degree view across our path to spot loot and hunters early
+            base = move_yaw if move_yaw is not None else me["aim"][0] + 0.6
+            aim = [wrap(base + 0.9 * math.sin(t * 1.6)), 0.0]
         act["aim"] = aim
         act["fire"] = fire
         return act
