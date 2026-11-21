@@ -75,7 +75,7 @@ async def play_one(args, outdir):
                 m["map"]["dir"] = str(ROOT / "arena")
                 summary["slot"] = m.get("slot")
                 proc = await asyncio.create_subprocess_exec(
-                    sys.executable, "-u", str(ROOT / "bot.py"),
+                    sys.executable, "-u", args.bot,
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 asyncio.create_task(pump_stderr(proc, outdir / "bot.stderr"))
                 proc.stdin.write((json.dumps(m) + "\n").encode())
@@ -111,12 +111,14 @@ async def main():
     ap.add_argument("--name", default="survivor-test")
     ap.add_argument("--matches", type=int, default=1)
     ap.add_argument("--private", action="store_true", help="own room: us against the house bots")
+    ap.add_argument("--bot", default=str(ROOT / "bot.py"), help="bot script to run")
+    ap.add_argument("--logdir", default=str(ROOT / "logs"))
     args = ap.parse_args()
     if not args.room and not args.private:
         import urllib.request
         args.room = json.load(urllib.request.urlopen("https://play.joinbuilders.org/mm/pick?lead=8", timeout=5))["room"]
     for _ in range(args.matches):
-        outdir = ROOT / "logs" / time.strftime("%Y%m%d-%H%M%S")
+        outdir = Path(args.logdir) / (time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex())
         outdir.mkdir(parents=True, exist_ok=True)
         s = await play_one(args, outdir)
         (outdir / "summary.json").write_text(json.dumps(s, indent=1))
