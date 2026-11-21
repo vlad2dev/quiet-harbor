@@ -12,7 +12,7 @@ from array import array
 import mechfight as mf
 
 CELL = 4.0  # navigation grid, meters
-TICK_BUDGET = 0.022  # seconds of path search per decision
+TICK_BUDGET = 0.015  # seconds of path search per decision
 
 
 def log(*a):
@@ -49,6 +49,7 @@ class Grid:
                 ground[j * self.nx + i] = self.height(x, y)
         self.ground = ground
         blocked = bytearray(n)
+        self.htop = [0.0] * n  # tallest solid above ground in the cell (m)
         # border margin: the map edge is a wall
         for j in range(self.ny):
             for i in range(self.nx):
@@ -100,6 +101,8 @@ class Grid:
                     if p["top"] - g <= 1.0:
                         continue
                     blocked[k] = 1
+                    if p["top"] - g > self.htop[k]:
+                        self.htop[k] = p["top"] - g
         # inflate by one cell: the mech is 5 m wide
         infl = bytearray(blocked)
         nx = self.nx
@@ -153,6 +156,25 @@ class Grid:
         i = min(max(int((x - self.minx) / CELL), 0), self.nx - 1)
         j = min(max(int((y - self.miny) / CELL), 0), self.ny - 1)
         return j * self.nx + i
+
+    def los(self, ax, ay, bx, by, h=7.5):
+        """Line of fire between two mechs: no building taller than h m on the segment (2.5 m steps)."""
+        dx, dy = bx - ax, by - ay
+        n = int(math.hypot(dx, dy) / 2.5)
+        if n < 2:
+            return True
+        htop, nx, ny, minx, miny = self.htop, self.nx, self.ny, self.minx, self.miny
+        inv = 1.0 / CELL
+        sx, sy = dx / n, dy / n
+        px, py = ax - minx, ay - miny
+        for _ in range(1, n):
+            px += sx
+            py += sy
+            i = int(px * inv)
+            j = int(py * inv)
+            if 0 <= i < nx and 0 <= j < ny and htop[j * nx + i] > h:
+                return False
+        return True
 
     def free(self, k):
         return not self.blocked[k]
@@ -398,6 +420,79 @@ class Bot:
                 bs, best = s, e
         return best
 
+    def tactical(self, me, target, enemies, want, ready, hp_frac):
+        """Score nearby cells (Killzone-style weighted sum) and return the best destination.
+
+        Good cells see the target (when our weapons are ready), are hidden from every other
+        hunter, sit near our preferred range, and are cheap to reach."""
+        g = self.grid
+        x, y = me["pos"][0], me["pos"][1]
+        ci, cj = int((x - g.minx) / CELL), int((y - g.miny) / CELL)
+        others = [e for e in enemies if e is not target and e["_d"] < 220][:4]
+        tx, ty = target["pos"][0], target["pos"][1]
+        w_fire = 3.0 if ready else -1.0          # want a shot when ready, want to be hidden when not
+        w_other = 2.5 + (2.0 if hp_frac < 0.5 else 0.0)
+        best, bs = None, -1e18
+        R = 4
+        for dj in range(-R, R + 1):
+            for di in range(-R, R + 1):
+                if di * di + dj * dj > R * R + 1:
+                    continue
+                i, j = ci + di, cj + dj
+                if i < 1 or j < 1 or i >= g.nx - 1 or j >= g.ny - 1:
+                    continue
+                k = j * g.nx + i
+                if g.blocked[k]:
+                    continue
+                px, py = (x, y) if (di == 0 and dj == 0) else g.center(i, j)
+                dt = math.hypot(px - tx, py - ty)
+                sees = dt < 230 and g.los(px, py, tx, ty)
+                sc = w_fire * (1.0 if sees else 0.0)
+                for e in others:
+                    if g.los(px, py, e["pos"][0], e["pos"][1]):
+                        sc -= w_other * (1.0 if e["_d"] < 120 else 0.5)
+                sc -= abs(dt - want) / 40.0
+                sc -= math.hypot(px - x, py - y) / 25.0
+                if g.soft[k] == 2:
+                    sc += 0.3  # hugging a wall: cover is a step away
+                sc += random.random() * 0.25  # do not be predictable
+                if sc > bs:
+                    bs, best = sc, (px, py)
+        return best
+
+    def blocked_line(self, ax, ay, bx, by):
+        """True if a building cell lies on the segment between two points (sampled every 2 m)."""
+        g = self.grid
+        n = int(math.hypot(bx - ax, by - ay) / 3.0)
+        for i in range(1, n):
+            f = i / n
+            if g.blocked[g.cell(ax + (bx - ax) * f, ay + (by - ay) * f)] == 1:
+                return True
+        return False
+
+    def find_cover(self, me, threats):
+        """Nearest walkable cell within ~45 m that every listed threat's line of sight is blocked from."""
+        g = self.grid
+        x, y = me["pos"][0], me["pos"][1]
+        ci, cj = int((x - g.minx) / CELL), int((y - g.miny) / CELL)
+        best, bd = None, 1e9
+        R = 10
+        for dj in range(-R, R + 1):
+            for di in range(-R, R + 1):
+                i, j = ci + di, cj + dj
+                if i < 1 or j < 1 or i >= g.nx - 1 or j >= g.ny - 1:
+                    continue
+                k = j * g.nx + i
+                if g.blocked[k]:
+                    continue
+                px, py = g.center(i, j)
+                d = math.hypot(px - x, py - y)
+                if d >= bd or d > 46:
+                    continue
+                if all(self.blocked_line(e["pos"][0], e["pos"][1], px, py) for e in threats):
+                    best, bd = (px, py), d
+        return best
+
     def upgrade_pick(self, offer):
         pref = ["armor", "plating", "gun_damage", "lightning_efficiency", "gun_rate", "laser_damage",
                 "nanites", "lightning_chain", "laser_charge", "servos", "gun_mag", "lightning_range",
@@ -487,9 +582,14 @@ class Bot:
 
         # recover: when low and nobody is on top of us, stop shooting and get out of sight to regenerate
         near = min((e["_d"] for e in enemies), default=1e9)
-        if hp_frac < 0.4 and near > 55:
+        hurt_recently = t - getattr(self, "last_hurt", -99) < 2.5
+        # a hunter with less hp than us is worth finishing; otherwise break off when low
+        weak_target = target is not None and (target.get("hp") or 1400) < me["hp"] * 0.8
+        # duel stats: hurt and without a laser we win 17% of fights, at full hp 56-72%. Heal first.
+        heal_below = 0.7 if "laser" in kinds else 0.8
+        if hp_frac < heal_below and near > 60 and not weak_target:
             self.recovering = True
-        if getattr(self, "recovering", False) and (hp_frac > 0.85 or near < 40):
+        if getattr(self, "recovering", False) and (hp_frac > 0.97 or near < 40 or (weak_target and near < 80)):
             self.recovering = False
         recovering = getattr(self, "recovering", False) and not urgent
         if recovering:
@@ -542,7 +642,18 @@ class Bot:
         # ----- movement -----
         move_yaw = None
         boost = False
-        if recovering:
+        cover = None
+        if recovering and self.grid is not None and enemies:
+            if t - getattr(self, "cover_t", -9) > 0.8 or getattr(self, "cover_pt", None) is None:
+                self.cover_t = t
+                self.cover_pt = self.find_cover(me, enemies[:3])
+            cover = self.cover_pt
+        if cover is not None and math.dist(cover, (x, y)) > 3:
+            move_yaw = math.atan2(cover[1] - y, cover[0] - x)
+            boost = me["energy"] > 15
+        elif cover is not None:
+            move_yaw = None  # in cover: stand still, silent, regenerate
+        elif recovering:
             rx = ry = 0.0
             for e in enemies + npcs:
                 dd = max(e["_d"], 5.0)
@@ -582,13 +693,28 @@ class Bot:
                 move_yaw = away
                 boost = me["energy"] > 10
             else:
-                radial = 0.0
-                if d > want + 15:
-                    radial = 1.0
-                elif d < want - 12:
-                    radial = -0.8
-                mx = math.cos(perp) + radial * math.cos(to_t)
-                my = math.sin(perp) + radial * math.sin(to_t)
+                g0 = weapons[0]
+                w1 = weapons[1]
+                ready = bool(g0 and g0.get("reload", 0) == 0 and g0.get("ammo", 1) > 0) or                     bool(w1 and w1["kind"] == "laser" and w1["cooldown"] <= 0.3)
+                if hp_frac < 0.35 and ehp > me["hp"]:
+                    ready = False
+                if self.grid is not None and (t - getattr(self, "tac_t", -9) > 0.3 or getattr(self, "tac_pt", None) is None):
+                    self.tac_t = t
+                    self.tac_pt = self.tactical(me, target, enemies, want, ready, hp_frac)
+                dest = getattr(self, "tac_pt", None) if self.grid is not None else None
+                if dest is not None and math.hypot(dest[0] - x, dest[1] - y) > 2.5:
+                    dyaw = math.atan2(dest[1] - y, dest[0] - x)
+                    # keep a sideways jitter so we are hard to lead
+                    mx = math.cos(dyaw) + 0.5 * math.cos(perp)
+                    my = math.sin(dyaw) + 0.5 * math.sin(perp)
+                else:
+                    radial = 0.0
+                    if d > want + 15:
+                        radial = 1.0
+                    elif d < want - 12:
+                        radial = -0.8
+                    mx = math.cos(perp) + radial * math.cos(to_t)
+                    my = math.sin(perp) + radial * math.sin(to_t)
                 move_yaw = math.atan2(my, mx)
                 if d < 150 and me["energy"] > 25:
                     boost = True
