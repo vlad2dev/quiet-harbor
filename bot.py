@@ -364,7 +364,8 @@ class Bot:
         ox, oy, oz = sx, sy, sz + mh
         px, py, pz = t["pos"]
         vx, vy, vz = t.get("vel", [0, 0, 0])
-        tz = pz + 4.5
+        kind = t.get("kind", "crate")
+        tz = pz + (4.5 if kind == "mech" else 1.75 if kind == "npc" else 0.8)
         tt = 0.0
         for _ in range(3):
             ax, ay, az = px + vx * tt, py + vy * tt, tz + vz * tt
@@ -469,9 +470,20 @@ class Bot:
         npc_target = None
         if target is None:
             for n in npcs:
-                if attacker is n or (n["_d"] < 70 and hp_frac > 0.6):
+                if attacker is n or (n["_d"] < 130 and hp_frac > 0.55):
                     npc_target = n
                     break
+            if npc_target is None and hp_frac > 0.3:
+                best = None
+                for c in obs.get("crates", []):
+                    if abs(c["pos"][2] - z) > 3:
+                        continue  # rooftop: cubes would land out of reach
+                    d = math.dist(c["pos"][:2], (x, y))
+                    if d < 160 and (best is None or d < best[0]):
+                        best = (d, c)
+                if best is not None:
+                    c = best[1]
+                    npc_target = {"kind": "crate", "id": c["id"], "pos": c["pos"], "vel": [0, 0, 0], "_d": best[0]}
 
         # recover: when low and nobody is on top of us, stop shooting and get out of sight to regenerate
         near = min((e["_d"] for e in enemies), default=1e9)
@@ -572,7 +584,9 @@ class Bot:
         elif npc_target is not None and not urgent:
             n = npc_target
             to_n = math.atan2(n["pos"][1] - y, n["pos"][0] - x)
-            if n["_d"] > 45:
+            if n["kind"] == "crate":
+                move_yaw = to_n if n["_d"] > 12 else None  # walk up to it: its cube drops right there
+            elif n["_d"] > 45:
                 move_yaw = to_n
             else:
                 move_yaw = to_n + math.pi / 2 * (1 if int(t / 2) % 2 else -1)
@@ -640,7 +654,7 @@ class Bot:
             if w1:
                 if w1["kind"] == "laser":
                     direct = [math.atan2(shoot["pos"][1] - y, shoot["pos"][0] - x),
-                              math.atan2(shoot["pos"][2] + 4.5 - (z + 7), max(dh, 1))]
+                              math.atan2(shoot["pos"][2] + (4.5 if shoot.get("kind") == "mech" else 1.75 if shoot.get("kind") == "npc" else 0.8) - (z + me.get("stats", {}).get("muzzle_height", 7)), max(dh, 1))]
                     ch = w1.get("charge", 0)
                     full = w1["stats"].get("charge", 0.75)
                     if w1["cooldown"] <= 0 and dh < w1["stats"].get("range", 280) * 0.95:
